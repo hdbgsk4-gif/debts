@@ -1,0 +1,531 @@
+nups(): List<DebtGroup> {
+        val result = mutableListOf<DebtGroup>()
+        readableDatabase.rawQuery("SELECT id,name FROM debt_groups ORDER BY id DESC", null)
+            .use { c ->
+                while (c.moveToNext()) result.add(DebtGroup(c.getLong(0), c.getString(1)))
+            }
+        return result
+    }
+
+    fun addDebtor(groupId: Long, name: String, amount: Double): Long {
+        val values = ContentValues().apply {
+            put("group_id", groupId)
+            put("name", name)
+            put("amount", amount)
+        }
+        return writableDatabase.insert("debtors", null, values)
+    }
+
+    fun updateDebtor(id: Long, name: String, amount: Double) {
+        val values = ContentValues().apply {
+            put("name", name)
+            put("amount", amount)
+        }
+        writableDatabase.update("debtors", values, "id=?", arrayOf(id.toString()))
+    }
+
+    fun deleteDebtor(id: Long) {
+        writableDatabase.delete("debtors", "id=?", arrayOf(id.toString()))
+    }
+
+    fun debtors(groupId: Long): List<Debtor> {
+        val result = mutableListOf<Debtor>()
+        readableDatabase.rawQuery(
+            "SELECT id,group_id,name,amount FROM debtors WHERE group_id=? ORDER BY id",
+            arrayOf(groupId.toString())
+        ).use { c ->
+            while (c.moveToNext()) {
+                result.add(Debtor(c.getLong(0), c.getLong(1), c.getString(2), c.getDouble(3)))
+            }
+        }
+        return result
+    }
+}
+
+class MainActivity : Activity() {
+
+    private lateinit var db: DebtDatabase
+    private lateinit var root: LinearLayout
+    private lateinit var groupSpinner: Spinner
+    private lateinit var listContainer: LinearLayout
+    private lateinit var totalLabel: TextView
+    private var groups: List<DebtGroup> = emptyList()
+    private var selectedGroupId: Long = -1L
+    private var pendingPdfGroup: DebtGroup? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        db = DebtDatabase(this)
+        buildScreen()
+        refreshGroups()
+    }
+
+    private fun buildScreen() {
+        root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(CREAM)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(20, 24, 20, 22)
+            setBackgroundColor(BURGUNDY)
+        }
+        header.addView(label("المها للتسويق", 27f, GOLD, true, Gravity.CENTER))
+        header.addView(label("إدارة حسابات ومديونيات العملاء", 14f, -1, false, Gravity.CENTER))
+        root.addView(header)
+
+        val scroll = ScrollView(this)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 14, 16, 22)
+        }
+        scroll.addView(content)
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        content.addView(sectionTitle("مجموعات المدينين"))
+
+        groupSpinner = Spinner(this)
+        content.addView(groupSpinner, matchWrap())
+        groupSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            override fun onItemSelected(
+                parent: android.widget.AdapterView<*>?, view: View?, position: Int, id: Long
+            ) {
+                if (position in groups.indices) {
+                    selectedGroupId = groups[position].id
+                    refreshDebtors()
+                }
+            }
+        }
+
+        val groupButtons = horizontalRow()
+        groupButtons.addView(actionButton("＋ مجموعة جديدة", GOLD, DARK_BURGUNDY) {
+            showTextDialog("إنشاء مجموعة", "اسم المجموعة") { name ->
+                if (db.addGroup(name) > 0) refreshGroups()
+            }
+        }, weightedParams())
+        groupButtons.addView(actionButton("تعديل الاسم", BURGUNDY, -1) {
+            currentGroup()?.let { group ->
+                showTextDialog("تعديل اسم المجموعة", "اسم المجموعة", group.name) { name ->
+                    db.updateGroup(group.id, name)
+                    refreshGroups(group.id)
+                }
+            } ?: toast("أنشئ مجموعة أولاً")
+        }, weightedParams())
+        groupButtons.addView(actionButton("حذف المجموعة", DARK_BURGUNDY, -1) {
+            currentGroup()?.let { group ->
+                AlertDialog.Builder(this)
+                    .setTitle("حذف المجموعة")
+                    .setMessage("سيتم حذف المجموعة وجميع المدينين المسجلين فيها. هل تريد المتابعة؟")
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("حذف") { _, _ ->
+                        db.deleteGroup(group.id)
+                        selectedGroupId = -1L
+                        refreshGroups()
+                    }.show()
+            } ?: toast("لا توجد مجموعة محددة")
+        }, weightedParams())
+        content.addView(groupButtons)
+
+        content.addView(sectionTitle("المدينون"))
+        content.addView(actionButton("＋ إضافة مدين جديد", BURGUNDY, -1) {
+            if (currentGroup() == null) toast("أنشئ مجموعة أولاً")
+            else showDebtorDialog(null)
+        }, matchWrap())
+
+        totalLabel = label("إجمالي الديون: 0", 18f, BURGUNDY, true, Gravity.CENTER)
+        totalLabel.setPadding(8, 16, 8, 12)
+        content.addView(totalLabel)
+
+        listContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(listContainer, matchWrap())
+
+        content.addView(sectionTitle("ملف المجموعة"))
+        content.addView(actionButton("إنشاء / تحديث ملف PDF", GOLD, DARK_BURGUNDY) {
+            val group = currentGroup()
+            if (group == null) toast("اختر مجموعة أولاً")
+            else {
+                pendingPdfGroup = group
+                val safeName = group.name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                val date = SimpleDateFormat("yyyyMMdd_HHmm", Locale.getDefault()).format(Date())
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "application/pdf"
+                    putExtra(Intent.EXTRA_TITLE, "${safeName}_$date.pdf")
+                }
+                @Suppress("DEPRECATION")
+                startActivityForResult(intent, REQUEST_CREATE_PDF)
+            }
+        }, matchWrap())
+
+        val note = label(
+            "ملاحظة: تعديل المدينين يتم من داخل التطبيق، ثم أعد تصدير PDF للحصول على النسخة المحدثة.",
+            12f, INK, false, Gravity.CENTER
+        )
+        note.setPadding(8, 14, 8, 8)
+        content.addView(note)
+
+        setContentView(root)
+    }
+
+    private fun refreshGroups(preferredId: Long = selectedGroupId) {
+        groups = db.groups()
+        val names = if (groups.isEmpty()) listOf("لا توجد مجموعات - أنشئ مجموعة جديدة")
+                    else groups.map { it.name }
+        groupSpinner.adapter = ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, names
+        )
+        val index = groups.indexOfFirst { it.id == preferredId }.let { if (it < 0) 0 else it }
+        if (groups.isNotEmpty()) {
+            groupSpinner.setSelection(index)
+            selectedGroupId = groups[index].id
+            refreshDebtors()
+        } else {
+            selectedGroupId = -1L
+            refreshDebtors()
+        }
+    }
+
+    private fun currentGroup(): DebtGroup? = groups.firstOrNull { it.id == selectedGroupId }
+
+    private fun refreshDebtors() {
+        listContainer.removeAllViews()
+        val group = currentGroup()
+        if (group == null) {
+            totalLabel.text = "إجمالي الديون: 0"
+            listContainer.addView(label("لا توجد مجموعة حالياً.", 14f, INK, false, Gravity.CENTER))
+            return
+        }
+        val debtors = db.debtors(group.id)
+        val total = debtors.sumOf { it.amount }
+        totalLabel.text = "إجمالي الديون: ${money(total)}"
+
+        if (debtors.isEmpty()) {
+            listContainer.addView(label("لا يوجد مدينون في هذه المجموعة. أضف أول مدين.", 14f, INK, false, Gravity.CENTER))
+        }
+
+        debtors.forEachIndexed { index, debtor ->
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(14, 12, 14, 12)
+                setBackgroundColor(-1)
+                elevation = 2f
+            }
+            val title = label("${index + 1}. ${debtor.name}", 17f, BURGUNDY, true, Gravity.START)
+            card.addView(title)
+            card.addView(label("المبلغ: ${money(debtor.amount)}", 15f, INK, false, Gravity.START))
+            val buttons = horizontalRow()
+            buttons.addView(actionButton("تعديل", GOLD, DARK_BURGUNDY) {
+                showDebtorDialog(debtor)
+            }, weightedParams())
+            buttons.addView(actionButton("حذف", DARK_BURGUNDY, -1) {
+                AlertDialog.Builder(this)
+                    .setMessage("هل تريد حذف المدين ${debtor.name}؟")
+                    .setNegativeButton("إلغاء", null)
+                    .setPositiveButton("حذف") { _, _ ->
+                        db.deleteDebtor(debtor.id)
+                        refreshDebtors()
+                    }.show()
+            }, weightedParams())
+            card.addView(buttons)
+            val lp = matchWrap()
+            lp.bottomMargin = 10
+            listContainer.addView(card, lp)
+        }
+    }
+
+    private fun showDebtorDialog(debtor: Debtor?) {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(22, 8, 22, 0)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val nameInput = EditText(this).apply {
+            hint = "اسم المدين"
+            singleLine = true
+            textSize = 16f
+            setText(debtor?.name ?: "")
+        }
+        val amountInput = EditText(this).apply {
+            hint = "المبلغ"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            textSize = 16f
+            setText(if (debtor == null) "" else debtor.amount.toString())
+        }
+        box.addView(nameInput, matchWrap())
+        box.addView(amountInput, matchWrap())
+
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(if (debtor == null) "إضافة مدين" else "تعديل بيانات المدين")
+            .setView(box)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val name = nameInput.text.toString().trim()
+                val amount = amountInput.text.toString().trim().replace(',', '.').toDoubleOrNull()
+                when {
+                    name.isEmpty() -> nameInput.error = "اكتب اسم المدين"
+                    amount == null || amount < 0 -> amountInput.error = "أدخل مبلغاً صحيحاً"
+                    else -> {
+                        if (debtor == null) {
+                            val group = currentGroup()
+                            if (group != null) db.addDebtor(group.id, name, amount)
+                        } else {
+                            db.updateDebtor(debtor.id, name, amount)
+                        }
+                        dialog.dismiss()
+                        refreshDebtors()
+                    }
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    private fun showTextDialog(
+        title: String, hint: String, initial: String = "", onSave: (String) -> Unit
+    ) {
+        val input = EditText(this).apply {
+            this.hint = hint
+            setText(initial)
+            setPadding(24, 16, 24, 16)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(input)
+            .setNegativeButton("إلغاء", null)
+            .setPositiveButton("حفظ", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val value = input.text.toString().trim()
+                if (value.isEmpty()) input.error = "هذا الحقل مطلوب"
+                else {
+                    onSave(value)
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.show()
+    }
+
+    @Deprecated("استخدام نتيجة اختيار مكان حفظ PDF")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQUEST_CREATE_PDF && resultCode == RESULT_OK) {
+            val uri = data?.data
+            val group = pendingPdfGroup
+            if (uri != null && group != null) createPdf(uri, group)
+        }
+    }
+
+    private fun createPdf(uri: Uri, group: DebtGroup) {
+        val debtors = db.debtors(group.id)
+        val document = PdfDocument()
+        try {
+            // صفحة A4 عمودية تقريباً: 595 × 842 نقطة.
+            val pageWidth = 595
+            val pageHeight = 842
+            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
+            val page = document.startPage(pageInfo)
+            val canvas = page.canvas
+            canvas.drawColor(-1)
+
+            val margin = 28f
+            val burgundyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = BURGUNDY
+                style = Paint.Style.FILL
+            }
+            val goldPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = GOLD
+                style = Paint.Style.FILL
+            }
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = INK
+                textSize = 12f
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            }
+            val boldPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = BURGUNDY
+                textSize = 14f
+                typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            }
+
+            canvas.drawRect(0f, 0f, pageWidth.toFloat(), 112f, burgundyPaint)
+            drawCentered(canvas, "المها للتسويق", 42f, 31f, goldPaint.apply {
+                typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            })
+            drawCentered(canvas, "كشف حساب المدينين", 76f, 19f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = -1
+                textSize = 17f
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            drawCentered(canvas, group.name, 101f, 13f, Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = -1
+                textSize = 12f
+            })
+
+            val date = SimpleDateFormat("yyyy/MM/dd", Locale.getDefault()).format(Date())
+            textPaint.textSize = 9f
+            canvas.drawText("تاريخ الإصدار: $date", margin, 132f, textPaint)
+
+            val tableTop = 151f
+            val tableBottom = 790f
+            val headerHeight = 28f
+            val availableRowsHeight = tableBottom - tableTop - headerHeight - 48f
+            val rowHeight = if (debtors.isEmpty()) 28f else
+                (availableRowsHeight / debtors.size).coerceAtLeast(1f)
+            val actualFont = (rowHeight * 0.48f).coerceIn(1.5f, 12f)
+
+            // رأس الجدول
+            canvas.drawRect(margin, tableTop, pageWidth - margin, tableTop + headerHeight, burgundyPaint)
+            val whitePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = -1
+                textSize = 12f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            drawRight(canvas, "م", pageWidth - margin - 15f, tableTop + 19f, whitePaint)
+            drawRight(canvas, "اسم المدين", pageWidth - margin - 55f, tableTop + 19f, whitePaint)
+            drawLeft(canvas, "المبلغ", margin + 14f, tableTop + 19f, whitePaint)
+
+            var y = tableTop + headerHeight
+            val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFFE7DFD9.toInt()
+                strokeWidth = 0.7f
+            }
+            val rowTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = INK
+                textSize = actualFont
+                typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            }
+
+            debtors.forEachIndexed { index, debtor ->
+                val bottom = y + rowHeight
+                if (index % 2 == 0) {
+                    val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFFFF9F0.toInt() }
+                    canvas.drawRect(margin, y, pageWidth - margin, bottom, bg)
+                }
+                val baseline = y + (rowHeight / 2f) + (actualFont * 0.35f)
+                drawRight(canvas, (index + 1).toString(), pageWidth - margin - 15f, baseline, rowTextPaint)
+                drawRight(canvas, debtor.name, pageWidth - margin - 55f, baseline, rowTextPaint)
+                drawLeft(canvas, money(debtor.amount), margin + 14f, baseline, rowTextPaint)
+                canvas.drawLine(margin, bottom, pageWidth - margin, bottom, linePaint)
+                y = bottom
+            }
+
+            val total = debtors.sumOf { it.amount }
+            val totalY = (y + 20f).coerceAtMost(805f)
+            canvas.drawRect(margin, totalY, pageWidth - margin, totalY + 30f, goldPaint)
+            val totalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = DARK_BURGUNDY
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            drawRight(canvas, "الإجمالي الكلي: ${money(total)}", pageWidth - margin - 12f,
+                totalY + 20f, totalPaint)
+
+            val footerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF777777.toInt()
+                textSize = 8f
+            }
+            drawCentered(canvas, "المها للتسويق - كشف داخلي", 832f, 8f, footerPaint)
+
+            document.finishPage(page)
+            contentResolver.openOutputStream(uri)?.use { output ->
+                document.writeTo(output)
+            } ?: throw IllegalStateException("تعذر فتح ملف الحفظ")
+            toast("تم إنشاء ملف PDF بنجاح")
+        } catch (e: Exception) {
+            toast("تعذر إنشاء PDF: ${e.localizedMessage ?: "خطأ غير معروف"}")
+        } finally {
+            document.close()
+        }
+    }
+
+    private fun drawCentered(canvas: Canvas, text: String, y: Float, size: Float, source: Paint) {
+        val p = Paint(source).apply { textSize = size }
+        canvas.drawText(text, (canvas.width - p.measureText(text)) / 2f, y, p)
+    }
+
+    private fun drawRight(canvas: Canvas, text: String, x: Float, y: Float, p: Paint) {
+        val safe = fitText(text, p, x - 8f)
+        canvas.drawText(safe, x - p.measureText(safe), y, p)
+    }
+
+    private fun drawLeft(canvas: Canvas, text: String, x: Float, y: Float, p: Paint) {
+        val safe = fitText(text, p, canvas.width - x - 8f)
+        canvas.drawText(safe, x, y, p)
+    }
+
+    private fun fitText(text: String, paint: Paint, maxWidth: Float): String {
+        if (paint.measureText(text) <= maxWidth) return text
+        var result = text
+        while (result.isNotEmpty() && paint.measureText("$result…") > maxWidth) {
+            result = result.dropLast(1)
+        }
+        return if (result.isEmpty()) "" else "$result…"
+    }
+
+    private fun money(value: Double): String =
+        String.format(Locale.getDefault(), "%,.2f", value)
+
+    private fun label(
+        text: String, size: Float, color: Int, bold: Boolean, gravity: Int
+    ) = TextView(this).apply {
+        this.text = text
+        textSize = size
+        setTextColor(color)
+        this.gravity = gravity
+        typeface = if (bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        setPadding(4, 5, 4, 5)
+        layoutDirection = View.LAYOUT_DIRECTION_RTL
+    }
+
+    private fun sectionTitle(text: String) = label(text, 18f, BURGUNDY, true, Gravity.START).apply {
+        setPadding(2, 18, 2, 8)
+    }
+
+    private fun horizontalRow() = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER
+        layoutDirection = View.LAYOUT_DIRECTION_LTR
+    }
+
+    private fun actionButton(
+        text: String, background: Int, foreground: Int, action: () -> Unit
+    ) = Button(this).apply {
+        this.text = text
+        textSize = 12f
+        setTextColor(foreground)
+        setBackgroundColor(background)
+        isAllCaps = false
+        setPadding(5, 4, 5, 4)
+        setOnClickListener { action() }
+    }
+
+    private fun matchWrap() = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+    )
+
+    private fun weightedParams() = LinearLayout.LayoutParams(
+        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+    ).apply {
+        marginStart = 3
+        marginEnd = 3
+    }
+
+    private fun toast(message: String) =
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+
+    override fun onDestroy() {
+        db.close()
+        super.onDestroy()
+    }
+}
